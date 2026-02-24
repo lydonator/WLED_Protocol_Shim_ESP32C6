@@ -11,6 +11,7 @@
 
 static const uint16_t WLED_UDP_PORT      = 21324;
 static const uint16_t WLED_HTTP_PORT     = 80;
+static const uint16_t DDP_UDP_PORT       = 4048;
 static const int64_t  WLED_ACTIVE_WINDOW = 3LL * 1000000LL;  // 3 seconds in µs
 
 // WLED_NUM_LEDS can be overridden via build_flags in your ESPHome YAML:
@@ -28,11 +29,22 @@ volatile uint8_t  g_wled_buf[WLED_NUM_LEDS * 3];
 volatile int64_t  g_wled_last_us = 0;
 SemaphoreHandle_t g_wled_mutex   = nullptr;
 
-// Returns true if a WLED packet was received within the last 3 seconds.
+// Returns true if a WLED or DDP packet was received within the last 3 seconds.
 inline bool wled_is_active() {
     if (g_wled_last_us == 0) return false;
     return (esp_timer_get_time() - g_wled_last_us) < WLED_ACTIVE_WINDOW;
 }
+
+// ── DDP protocol definitions ─────────────────────────────────────────────────
+// Distributed Display Protocol (DDP) by 3waylabs — http://www.3waylabs.com/ddp/
+// Header is 10 bytes, data follows immediately after.
+
+#define DDP_FLAGS1_VER1    0x40   // protocol version 1
+#define DDP_FLAGS1_PUSH    0x01   // push/display now
+#define DDP_FLAGS1_QUERY   0x02   // query packet
+#define DDP_FLAGS1_REPLY   0x04   // reply packet
+#define DDP_ID_DISPLAY     1      // default display output
+#define DDP_HEADER_LEN     10
 
 // ── Minimal WLED /json HTTP stub ──────────────────────────────────────────────
 // HyperHDR's WLED driver calls GET http://<host>/json before sending UDP data.
@@ -108,7 +120,7 @@ static void wled_http_task(void *pvParam) {
     }
 }
 
-// ── UDP realtime listener (WARLS / DRGB / DNRGB) ─────────────────────────────
+// ── WLED UDP realtime listener (WARLS / DRGB / DNRGB) ────────────────────────
 
 static void wled_udp_task(void *pvParam) {
     uint8_t recv_buf[512];
@@ -193,11 +205,91 @@ static void wled_udp_task(void *pvParam) {
     }
 }
 
-// Call once from on_boot (priority -100) — starts HTTP stub + UDP listener.
+// ── DDP UDP listener (port 4048) ─────────────────────────────────────────────
+// Handles Distributed Display Protocol packets from software like Hyperion.ng.
+// DDP header is 10 bytes:
+//   byte 0:   flags (version, push, query, reply)
+//   byte 1:   sequence number
+//   byte 2:   data type (0x01 = RGB)
+//   byte 3:   destination ID (0x01 = default display)
+//   bytes 4-7: data offset in bytes (32-bit MSB first)
+//   bytes 8-9: data length in bytes (16-bit MSB first)
+//   bytes 10+: RGB data
+
+static void ddp_udp_task(void *pvParam) {
+    // DDP max data per packet is 480 pixels * 3 bytes = 1440 bytes + 10 byte header
+    uint8_t recv_buf[1460];
+    int sock = -1;
+
+    for (;;) {
+        sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock < 0) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+
+        int reuse = 1;
+        ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        struct sockaddr_in bind_addr;
+        memset(&bind_addr, 0, sizeof(bind_addr));
+        bind_addr.sin_family      = AF_INET;
+        bind_addr.sin_addr.s_addr = INADDR_ANY;
+        bind_addr.sin_port        = htons(DDP_UDP_PORT);
+
+        if (::bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) == 0) break;
+
+        ::close(sock);
+        sock = -1;
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    for (;;) {
+        struct sockaddr_in sender;
+        socklen_t sender_len = sizeof(sender);
+        ssize_t len = ::recvfrom(sock, recv_buf, sizeof(recv_buf), 0,
+                                 (struct sockaddr *)&sender, &sender_len);
+
+        if (len < DDP_HEADER_LEN) continue;
+
+        uint8_t flags1  = recv_buf[0];
+        uint8_t data_id = recv_buf[3];
+
+        // Only handle write packets (not queries or replies) to the display ID
+        if ((flags1 & DDP_FLAGS1_QUERY) || (flags1 & DDP_FLAGS1_REPLY)) continue;
+        if (data_id != DDP_ID_DISPLAY) continue;
+
+        // Extract byte offset and data length from header (both MSB first)
+        uint32_t byte_offset = ((uint32_t)recv_buf[4] << 24) |
+                               ((uint32_t)recv_buf[5] << 16) |
+                               ((uint32_t)recv_buf[6] <<  8) |
+                                (uint32_t)recv_buf[7];
+
+        uint16_t data_len = ((uint16_t)recv_buf[8] << 8) | recv_buf[9];
+
+        // Sanity checks — data must fit in packet and not overflow our buffer
+        if (data_len == 0) continue;
+        if ((ssize_t)(DDP_HEADER_LEN + data_len) > len) continue;
+        if (byte_offset >= WLED_BUF_SIZE) continue;
+
+        const uint8_t *data = recv_buf + DDP_HEADER_LEN;
+
+        // Clamp copy length to what fits in our buffer from this offset
+        uint32_t bytes_to_copy = data_len;
+        if (byte_offset + bytes_to_copy > WLED_BUF_SIZE)
+            bytes_to_copy = WLED_BUF_SIZE - byte_offset;
+
+        if (xSemaphoreTake(g_wled_mutex, portMAX_DELAY) == pdTRUE) {
+            memcpy((void *)(g_wled_buf + byte_offset), data, bytes_to_copy);
+            g_wled_last_us = esp_timer_get_time();
+            xSemaphoreGive(g_wled_mutex);
+        }
+    }
+}
+
+// Call once from on_boot (priority -100) — starts HTTP stub, WLED UDP, and DDP listeners.
 inline void wled_udp_start() {
     g_wled_mutex = xSemaphoreCreateMutex();
     if (!g_wled_mutex) return;
     memset((void *)g_wled_buf, 0, WLED_BUF_SIZE);
     xTaskCreate(wled_http_task, "wled_http", 8192, nullptr, 1, nullptr);
     xTaskCreate(wled_udp_task,  "wled_udp",  4096, nullptr, 1, nullptr);
+    xTaskCreate(ddp_udp_task,   "ddp_udp",   4096, nullptr, 1, nullptr);
 }
