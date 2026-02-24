@@ -1,0 +1,86 @@
+substitutions:
+  led_count: "66"   # ← Change this one number to configure everywhere
+
+esphome:
+  name: wled-udp-example
+  friendly_name: WLED UDP Example
+  includes:
+    - wled_udp.h
+  platformio_options:
+    build_flags:
+      - "-DWLED_NUM_LEDS=${led_count}"  # Passes led_count into the header at compile time
+  on_boot:
+    - priority: -100
+      then:
+        - lambda: |-
+            wled_udp_start();
+
+esp32:
+  board: esp32-c6-devkitc-1
+  framework:
+    type: esp-idf
+    version: "5.5.2"
+    platform_version: 55.03.36-1
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "WLED-UDP Fallback"
+    password: "wledudp123"
+
+captive_portal:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTE: web_server MUST use port 8080
+# wled_udp.h occupies port 80 to serve the /json stub that HyperHDR expects.
+# ─────────────────────────────────────────────────────────────────────────────
+web_server:
+  port: 8080
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LED strip configuration
+# Adjust pin and rgb_order to match your hardware.
+# led_count is set once via the substitution above.
+# ─────────────────────────────────────────────────────────────────────────────
+light:
+  - platform: esp32_rmt_led_strip
+    id: led_strip
+    name: "LED Strip"
+    pin: GPIO3          # Change to your data pin
+    num_leds: ${led_count}
+    rgb_order: GRB      # WS2812B / WS2815 are GRB — adjust if needed
+    bit0_high: 300ns
+    bit0_low: 1000ns
+    bit1_high: 1000ns
+    bit1_low: 300ns
+    restore_mode: ALWAYS_OFF
+    effects:
+      - addressable_lambda:
+          name: "WLED"
+          update_interval: 33ms  # ~30fps
+          lambda: |-
+            if (initial_run && !wled_is_active()) {
+              it.all() = Color::BLACK;
+              return;
+            }
+            if (xSemaphoreTake(g_wled_mutex, 0) == pdTRUE) {
+              for (int i = 0; i < ${led_count}; i++) {
+                it[i] = Color(
+                  g_wled_buf[i * 3 + 0],
+                  g_wled_buf[i * 3 + 1],
+                  g_wled_buf[i * 3 + 2]
+                );
+              }
+              xSemaphoreGive(g_wled_mutex);
+            }
