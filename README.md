@@ -1,12 +1,16 @@
-# ESP32-C6 WLED Protocol Shim for ESPHome + HyperHDR (and potentially others)
+# ESP32-C6 WLED Protocol Shim for ESPHome
 
-A drop-in C++ header that lets your ESP32-C6 receive WLED realtime UDP data from HyperHDR (and potentially other WLED-compatible software) — without needing WLED firmware or NeoPixelBus.
+A drop-in C++ header that lets your ESP32-C6 receive LED colour data from ambilight and LED control software — without needing WLED firmware or NeoPixelBus.
+
+**Confirmed working with:**
+- ✅ [HyperHDR](https://github.com/awawa-dev/HyperHDR) — via WLED UDP protocol
+- ✅ [Hyperion.ng](https://github.com/hyperion-project/hyperion.ng) — via DDP protocol
 
 ---
 
 ## The Problem
 
-The **ESP32-C6** is an attractive microcontroller — it's affordable, capable, and supports WiFi 6. However, if you want to use it with **HyperHDR** (or any ambilight/LED control software that speaks the WLED protocol), you quickly run into a wall:
+The **ESP32-C6** is an attractive microcontroller — it's affordable, capable, and supports WiFi 6. However, if you want to use it with ambilight software like HyperHDR or Hyperion.ng, you quickly run into a wall:
 
 ### WLED doesn't support the ESP32-C6
 
@@ -23,7 +27,7 @@ This means the typical ESPHome approach to driving addressable LED strips is una
 
 ### What does work on the C6
 
-ESPHome's `esp32_rmt_led_strip` platform uses the ESP32's RMT peripheral directly and **does work** with esp-idf on the C6. So driving LEDs is actually fine — the gap is purely on the receiving side: getting colour data *into* the ESP32 from software like HyperHDR.
+ESPHome's `esp32_rmt_led_strip` platform uses the ESP32's RMT peripheral directly and **does work** with esp-idf on the C6. So driving LEDs is actually fine — the gap is purely on the receiving side: getting colour data *into* the ESP32 from external software.
 
 ### The typical advice
 
@@ -39,15 +43,16 @@ None of these help if you have a pile of C6s and want to use them *now*.
 
 ## The Solution
 
-This project implements a **minimal WLED protocol shim** as a single C++ header file (`wled_udp.h`) that you include in your ESPHome configuration.
+This project implements a **multi-protocol LED shim** as a single C++ header file (`wled_udp.h`) that you include in your ESPHome configuration.
 
-It does three things:
+It runs four things simultaneously:
 
-1. **Serves a fake WLED `/json` HTTP endpoint on port 80** — just enough JSON to convince HyperHDR that it's talking to a real WLED device and pass the LED count handshake.
-2. **Listens for WLED realtime UDP packets on port 21324** — handles the three main realtime protocols (WARLS, DRGB, DNRGB).
-3. **Stores received colour data in a shared buffer** — which your ESPHome `addressable_lambda` light effect reads every 33ms (~30fps) and writes to the physical LED strip via `esp32_rmt_led_strip`.
+1. **Serves a fake WLED `/json` HTTP endpoint on port 80** — just enough JSON to convince HyperHDR (and other WLED-aware software) that it's talking to a real WLED device and pass the LED count handshake.
+2. **Listens for WLED realtime UDP packets on port 21324** — handles WARLS, DRGB, and DNRGB protocols used by HyperHDR.
+3. **Listens for DDP packets on port 4048** — handles the Distributed Display Protocol used by Hyperion.ng and other software.
+4. **Stores received colour data in a shared buffer** — which your ESPHome `addressable_lambda` light effect reads every 33ms (~30fps) and writes to the physical LED strip via `esp32_rmt_led_strip`.
 
-The result: HyperHDR thinks it's talking to WLED. Your LEDs do exactly what HyperHDR tells them to. Your ESP32-C6 stays in ESPHome where you can manage it alongside the rest of your home automation.
+Both WLED UDP and DDP write into the same shared buffer, so whichever software is active just works — no configuration changes needed to switch between them.
 
 ---
 
@@ -55,7 +60,7 @@ The result: HyperHDR thinks it's talking to WLED. Your LEDs do exactly what Hype
 
 - ESP32-C6 (tested on `esp32-c6-devkitc-1`)
 - ESPHome with **esp-idf framework** (required for C6)
-- HyperHDR configured to use the **WLED** LED controller type
+- HyperHDR, Hyperion.ng, or other compatible software
 - Addressable LED strip compatible with `esp32_rmt_led_strip` (WS2812B, WS2815, etc.)
 
 ---
@@ -95,7 +100,7 @@ The `led_count` substitution flows through automatically to the header via a bui
 
 ### Step 3 — Move your web_server to port 8080
 
-**This is important.** The shim occupies **port 80** to serve the `/json` stub that HyperHDR expects. If you use ESPHome's `web_server` component, it must be moved to a different port:
+**This is important.** The shim occupies **port 80** to serve the `/json` stub. If you use ESPHome's `web_server` component, it must be moved to a different port:
 
 ```yaml
 web_server:
@@ -104,16 +109,13 @@ web_server:
 
 If you don't use `web_server`, you can omit it entirely.
 
-### Step 4 — Flash and configure HyperHDR
+### Step 4 — Flash and configure your software
 
-Flash your ESP32-C6 via ESPHome as normal. Then in HyperHDR:
+Flash your ESP32-C6 via ESPHome as normal. In your LED software, add a new WLED device pointing at your ESP32-C6's IP address and follow that software's usual setup instructions. The shim handles the rest transparently.
 
-1. Go to **LED Hardware**
-2. Set **Controller type** to `WLED`
-3. Enter your ESP32-C6's IP address
-4. HyperHDR will discover the device, check `/json`, and begin sending UDP data
+### Step 5 — Enable the WLED effect
 
-Once connected, enable the **WLED** effect on your ESPHome light entity and you're done.
+In your ESPHome/Home Assistant light entity, activate the **WLED** effect. Without this, the LED strip won't output anything even if data is being received.
 
 ---
 
@@ -123,7 +125,7 @@ Once connected, enable the **WLED** effect on your ESPHome light entity and you'
 
 HyperHDR's WLED driver performs a `GET /json` request before sending any LED data. It uses the response to verify the device is a WLED instance and to confirm the LED count.
 
-The shim runs a minimal TCP server on port 80 that responds to `GET` requests with just enough JSON to satisfy this check:
+The shim runs a minimal TCP server on port 80 that responds with just enough JSON to satisfy this check:
 
 ```json
 {
@@ -137,13 +139,11 @@ The shim runs a minimal TCP server on port 80 that responds to `GET` requests wi
 }
 ```
 
-The LED count in this response is driven by the same `WLED_NUM_LEDS` define as everything else, so it always stays in sync.
+The LED count is driven by the same `WLED_NUM_LEDS` define as everything else, so it always stays in sync.
 
-`POST /json` requests (brightness overrides) are acknowledged with a 200 OK and ignored — the shim defers all control to HyperHDR.
+### The WLED UDP listener (port 21324)
 
-### The UDP listener
-
-Once HyperHDR is satisfied with the handshake, it begins sending realtime colour data as UDP packets to port 21324. The shim handles three WLED realtime protocols:
+Used by HyperHDR. The shim handles three WLED realtime protocols:
 
 | Protocol | ID | Description |
 |---|---|---|
@@ -151,11 +151,25 @@ Once HyperHDR is satisfied with the handshake, it begins sending realtime colour
 | DRGB | `2` | Full frame — sends all LED colours in one packet |
 | DNRGB | `4` | Full frame with start offset — supports >256 LEDs |
 
-Received data is written into a shared buffer (`g_wled_buf`) protected by a FreeRTOS mutex.
+### The DDP listener (port 4048)
 
-### The ESPHome light effect
+Used by Hyperion.ng and other DDP-capable software. DDP ([Distributed Display Protocol](http://www.3waylabs.com/ddp/)) uses a compact 10-byte header followed by raw RGB data:
 
-An `addressable_lambda` effect polls the shared buffer every 33ms and writes the colour values to the physical LED strip:
+| Bytes | Content |
+|---|---|
+| 0 | Flags (version, push, query, reply) |
+| 1 | Sequence number |
+| 2 | Data type |
+| 3 | Destination ID |
+| 4–7 | Byte offset (32-bit MSB first) |
+| 8–9 | Data length (16-bit MSB first) |
+| 10+ | RGB data |
+
+The offset field allows large frames to be split across multiple packets, which the shim handles correctly by writing each chunk into the right position in the shared buffer.
+
+### The shared buffer and ESPHome light effect
+
+Both protocols write into the same shared buffer (`g_wled_buf`) protected by a FreeRTOS mutex. An `addressable_lambda` effect polls the buffer every 33ms and writes colour values to the LED strip:
 
 ```cpp
 if (xSemaphoreTake(g_wled_mutex, 0) == pdTRUE) {
@@ -170,16 +184,17 @@ if (xSemaphoreTake(g_wled_mutex, 0) == pdTRUE) {
 }
 ```
 
-The mutex `TryTake` with timeout `0` means if the UDP task is mid-write, the frame is simply skipped rather than blocking — this keeps the LED output smooth.
-
-If no WLED data has been received in the last 3 seconds, the strip is blanked, so your LEDs won't freeze on the last frame if HyperHDR disconnects.
+The mutex `TryTake` with timeout `0` means if a UDP task is mid-write, the frame is simply skipped rather than blocking — keeping the LED output smooth. If no data has been received for 3 seconds, the strip blanks so LEDs don't freeze on the last frame if software disconnects.
 
 ---
 
 ## Caveats
 
-**Tested with HyperHDR only.**
-This shim was developed and verified against HyperHDR's WLED controller implementation. Other software that uses the WLED protocol (SignalRGB, LightFX, Prismatik, etc.) may work, may partially work, or may query additional endpoints that the stub doesn't handle. Your mileage may vary. If you test another application and find issues, the HTTP handler in `wled_udp.h` is the place to look — additional endpoint handlers can be added to the `wled_http_task` function.
+**Tested with HyperHDR and Hyperion.ng only.**
+HyperHDR (WLED UDP) and Hyperion.ng (DDP) are confirmed working. Other software (SignalRGB, LightFX, Prismatik, LedFX, etc.) may work, may partially work, or may require additional endpoint support. If you test another application and find issues, please open an issue or PR.
+
+**Hyperion.ng on Wayland.**
+Hyperion.ng's X11 screen grabber does not work under Wayland. LED output via DDP works fine — the grabber issue only affects screen capture, not the LED data path. You can still manually set colours or use other input sources.
 
 **Linux development only.**
 This was developed on Linux. It has not been tested on Windows or macOS ESPHome environments. It should work, but is unverified.
@@ -188,13 +203,16 @@ This was developed on Linux. It has not been tested on Windows or macOS ESPHome 
 This shim only handles *receiving* realtime colour data from an external source. It does not implement WLED's built-in effects engine, segment support, or any other WLED features. It is purely a protocol bridge.
 
 **esp-idf framework required.**
-This will not compile under the Arduino framework. The ESP32-C6 requires esp-idf anyway, but if you attempt to use this on another board with Arduino framework it won't work.
+This will not compile under the Arduino framework. The ESP32-C6 requires esp-idf anyway, but if you attempt to use this on another board with the Arduino framework it won't work.
 
 **Port 80 is consumed.**
 The shim owns port 80 for the HTTP stub. Move any other services (ESPHome `web_server`, etc.) to alternative ports.
 
 **Single LED output only.**
 The current implementation drives one LED strip from one data pin. Multi-segment or multi-output configurations are not supported in this initial release.
+
+**Remember to enable the WLED effect.**
+The ESPHome light entity must have the WLED effect active to output anything. This is easy to forget — if your LEDs aren't responding despite data being received, check the effect is enabled.
 
 ---
 
@@ -208,14 +226,16 @@ This shim exists so you can use what you have.
 
 ## Contributing
 
-If you test this with software other than HyperHDR and it works (or doesn't), please open an issue or PR with your findings. Expanding the HTTP stub to handle additional endpoints is straightforward and contributions are welcome.
+If you test this with software other than HyperHDR and Hyperion.ng and it works (or doesn't), please open an issue or PR with your findings. Contributions are welcome.
 
 ---
 
 ## Acknowledgements
 
 - [WLED Project](https://github.com/Aircoookie/WLED) for the UDP realtime protocol specification
-- [HyperHDR](https://github.com/awawa-dev/HyperHDR) for the ambilight software this was developed against
+- [HyperHDR](https://github.com/awawa-dev/HyperHDR) for the ambilight software this was developed and tested against
+- [Hyperion.ng](https://github.com/hyperion-project/hyperion.ng) for DDP compatibility testing
+- [3waylabs](http://www.3waylabs.com/ddp/) for the DDP protocol specification
 - The ESP32-C6 WLED support issue thread, where the frustration that prompted this project lives
 
 ---
